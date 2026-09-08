@@ -1,0 +1,408 @@
+#!/usr/bin/python3
+import sys
+import tty
+import termios
+import select
+import requests
+import json
+import time
+import re
+import os
+
+VERSION = "v0.9.0"
+
+# Cache for fetched pages: page_num (int) -> API response JSON data (dict)
+cache = {}
+
+def get_key():
+    """Reads a single keypress (including arrow escape sequences) from standard input without buffering."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch_bytes = os.read(fd, 1)
+        if not ch_bytes:
+            return ''
+        ch = ch_bytes.decode('utf-8', errors='ignore')
+        if ch == '\x1b':
+            # Check for escape sequences (arrow keys)
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if r:
+                ch2_bytes = os.read(fd, 1)
+                ch2 = ch2_bytes.decode('utf-8', errors='ignore')
+                if ch2 == '[':
+                    r2, _, _ = select.select([fd], [], [], 0.1)
+                    if r2:
+                        ch3_bytes = os.read(fd, 1)
+                        ch3 = ch3_bytes.decode('utf-8', errors='ignore')
+                        return f'\x1b[{ch3}'
+                    return f'\x1b['
+                return f'\x1b{ch2}'
+            return '\x1b'
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def fetch_page_data(page_num: int):
+    """Fetches text-tv page data from SVT API, returning data dict or None."""
+    url = f"https://www.svt.se/text-tv/api/{page_num}"
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'success':
+                return data.get('data')
+    except Exception:
+        pass
+    return None
+
+def extract_links(raw_lines):
+    """Finds all 3-digit page links in the text-tv page (excluding the header)."""
+    links = []
+    global_idx = 0
+    # Skip line 0 (the header)
+    for line_idx in range(1, len(raw_lines)):
+        line = raw_lines[line_idx]
+        for m in re.finditer(r'\b([1-9]\d{2})\b', line):
+            links.append({
+                'page': int(m.group(1)),
+                'line_idx': line_idx,
+                'start': m.start(),
+                'end': m.end(),
+                'global_idx': global_idx
+            })
+            global_idx += 1
+    return links
+
+def render_line(line, line_idx, line_links, selected_link_index):
+    """Colors a line of text, highlighting the selected link and styling other links."""
+    if not line_links:
+        # Style all 3-digit numbers with standard yellow color
+        return re.sub(r'\b([1-9]\d{2})\b', r'\033[1;33m\1\033[0m', line)
+
+    parts = []
+    last_idx = 0
+    for link in line_links:
+        start, end = link['start'], link['end']
+        parts.append(line[last_idx:start])
+        val = line[start:end]
+
+        if link['global_idx'] == selected_link_index:
+            # Highlight selected link: white text on a cyan background
+            parts.append(f"\033[1;37;46m{val}\033[0m")
+        else:
+            # Unselected links: standard bold yellow
+            parts.append(f"\033[1;33m{val}\033[0m")
+        last_idx = end
+    parts.append(line[last_idx:])
+    return "".join(parts)
+
+def get_current_page_lines_and_links(page_data, subpage_idx):
+    """Processes page_data to return raw lines and list of links for a given subpage."""
+    if not page_data:
+        return [], []
+    subpages = page_data.get('subPages', [])
+    if not subpages or subpage_idx >= len(subpages):
+        return [], []
+    alt_text = subpages[subpage_idx].get('altText', '')
+    raw_lines = alt_text.split('\n')
+
+    header_idx = -1
+    for idx, line in enumerate(raw_lines):
+        if 'SVT Text' in line:
+            header_idx = idx
+            break
+
+    if header_idx != -1:
+        raw_lines = raw_lines[header_idx:]
+
+    while raw_lines and not raw_lines[-1].strip():
+        raw_lines.pop()
+
+    links = extract_links(raw_lines)
+    return raw_lines, links
+
+def draw_screen_with_lines(page_num, page_data, current_subpage_idx, input_buffer, lines, links, selected_link_idx, error_message=None):
+    """Clears the screen and draws the Teletext page lines and status bar."""
+    # Clear screen and move cursor to top-left
+    sys.stdout.write("\033[H\033[2J")
+
+    lines_to_print = []
+    if lines:
+        for line_idx, line in enumerate(lines):
+            if line_idx == 0:
+                padded = line.ljust(40)
+                lines_to_print.append(f"\033[1;37;44m{padded}\033[0m")
+            else:
+                line_links = [l for l in links if l['line_idx'] == line_idx]
+                rendered = render_line(line, line_idx, line_links, selected_link_idx)
+                lines_to_print.append(rendered)
+    elif page_data:
+        lines_to_print = ["", "  Inga undersidor tillgängliga.", ""]
+    else:
+        lines_to_print = [
+            "",
+            "  SVT Text-TV Terminalklient",
+            "",
+            f"  Hämtar sida {page_num}...",
+            "",
+        ]
+
+    for line in lines_to_print:
+        print(line)
+
+    # Anchored padding to 24 lines to keep status bar in a fixed position
+    for _ in range(len(lines_to_print), 24):
+        print()
+
+    if error_message:
+        status_text = f" FEL: {error_message}"
+        sys.stdout.write(f"\033[1;37;41m{status_text.ljust(40)[:40]}\033[0m")
+    else:
+        parts = []
+
+        # 1. Page & Subpage
+        subpages = page_data.get('subPages', []) if page_data else []
+        if len(subpages) > 1:
+            parts.append(f"{page_num}.{current_subpage_idx + 1}/{len(subpages)}")
+        else:
+            parts.append(str(page_num))
+
+        # 2. Selected Link
+        if 0 <= selected_link_idx < len(links):
+            parts.append(f"→{links[selected_link_idx]['page']}")
+
+        # 3. Search Box
+        parts.append(f"[{input_buffer.ljust(3, '_')}]")
+
+        # 4. Helpers
+        helpers = ["←→", "↑↓"]
+        if len(subpages) > 1:
+            helpers.append("+/-")
+        helpers.extend(["R", "Q"])
+        parts.append(" ".join(helpers))
+
+        status_text = " ".join(parts)
+        sys.stdout.write(f"\033[7m{status_text.ljust(40)[:40]}\033[0m")
+    sys.stdout.flush()
+
+def main():
+    global cache
+    # Enable alternate screen buffer and hide cursor
+    sys.stdout.write("\033[?1049h")
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+    current_page = 100
+    current_subpage_idx = 0
+    input_buffer = ""
+    error_message = None
+    selected_link_idx = -1
+
+    # Load initial page
+    page_data = None
+
+    try:
+        # Show loading indicator first
+        draw_screen_with_lines(current_page, None, 0, "", [], [], -1, None)
+        page_data = fetch_page_data(current_page)
+        if page_data:
+            cache[current_page] = page_data
+        else:
+            error_message = "Kunde inte hämta startsidan"
+
+        while True:
+            # Get current lines and links
+            lines, links = get_current_page_lines_and_links(page_data, current_subpage_idx)
+
+            # Reset/adjust selected index if out of range for this page
+            if links:
+                if selected_link_idx >= len(links):
+                    selected_link_idx = len(links) - 1
+            else:
+                selected_link_idx = -1
+
+            # Draw current state
+            draw_screen_with_lines(current_page, page_data, current_subpage_idx, input_buffer, lines, links, selected_link_idx, error_message)
+
+            # Read key
+            key = get_key()
+
+            # Reset error message when user takes any action
+            if error_message:
+                error_message = None
+
+            # Handle keys
+            if key.lower() == 'q':
+                break
+
+            elif key == '\x1b': # Escape key
+                if input_buffer:
+                    input_buffer = "" # Clear search buffer
+                elif selected_link_idx != -1:
+                    selected_link_idx = -1 # Deselect link
+                else:
+                    break # Exit
+
+            elif key in ['\x7f', '\x08']: # Backspace
+                if input_buffer:
+                    input_buffer = input_buffer[:-1]
+
+            elif key in ['\r', '\n']: # Enter
+                if selected_link_idx != -1 and 0 <= selected_link_idx < len(links):
+                    # Jump to selected link!
+                    target_page = links[selected_link_idx]['page']
+                    draw_screen_with_lines(target_page, None, 0, "", [], [], -1, None)
+
+                    if target_page in cache:
+                        new_data = cache[target_page]
+                    else:
+                        new_data = fetch_page_data(target_page)
+
+                    if new_data:
+                        cache[target_page] = new_data
+                        page_data = new_data
+                        current_page = target_page
+                        current_subpage_idx = 0
+                        selected_link_idx = -1
+                    else:
+                        error_message = f"Sida {target_page} kunde inte hämtas"
+                    input_buffer = ""
+
+            elif key.isdigit():
+                # Allow maximum 3 digits
+                if len(input_buffer) < 3:
+                    input_buffer += key
+                    selected_link_idx = -1 # Deselect link if user starts typing
+                    if len(input_buffer) == 3:
+                        try:
+                            target_page = int(input_buffer)
+                            if 100 <= target_page <= 999:
+                                draw_screen_with_lines(target_page, None, 0, "", [], [], -1, None)
+
+                                if target_page in cache:
+                                    new_data = cache[target_page]
+                                else:
+                                    new_data = fetch_page_data(target_page)
+
+                                if new_data:
+                                    cache[target_page] = new_data
+                                    page_data = new_data
+                                    current_page = target_page
+                                    current_subpage_idx = 0
+                                    selected_link_idx = -1
+                                else:
+                                    error_message = f"Sida {target_page} kunde inte hämtas"
+                            else:
+                                error_message = "Sidan måste vara mellan 100 och 999"
+                        except ValueError:
+                            error_message = "Ogiltigt sidnummer"
+                        input_buffer = ""
+
+            elif key == '\x1b[C' or key.lower() == 'n': # Right arrow (next page)
+                next_page = None
+                if page_data and page_data.get('nextPage'):
+                    try:
+                        next_page = int(page_data.get('nextPage'))
+                    except ValueError:
+                        pass
+                if not next_page:
+                    next_page = current_page + 1
+                    if next_page > 999:
+                        next_page = 100
+
+                # Fetch next page
+                draw_screen_with_lines(next_page, None, 0, "", [], [], -1, None)
+                if next_page in cache:
+                    new_data = cache[next_page]
+                else:
+                    new_data = fetch_page_data(next_page)
+
+                if new_data:
+                    cache[next_page] = new_data
+                    page_data = new_data
+                    current_page = next_page
+                    current_subpage_idx = 0
+                    selected_link_idx = -1
+                else:
+                    error_message = f"Sida {next_page} kunde inte hämtas"
+
+            elif key == '\x1b[D' or key.lower() == 'p': # Left arrow (previous page)
+                prev_page = None
+                if page_data and page_data.get('prevPage'):
+                    try:
+                        prev_page = int(page_data.get('prevPage'))
+                    except ValueError:
+                        pass
+                if not prev_page:
+                    prev_page = current_page - 1
+                    if prev_page < 100:
+                        prev_page = 999
+
+                # Fetch prev page
+                draw_screen_with_lines(prev_page, None, 0, "", [], [], -1, None)
+                if prev_page in cache:
+                    new_data = cache[prev_page]
+                else:
+                    new_data = fetch_page_data(prev_page)
+
+                if new_data:
+                    cache[prev_page] = new_data
+                    page_data = new_data
+                    current_page = prev_page
+                    current_subpage_idx = 0
+                    selected_link_idx = -1
+                else:
+                    error_message = f"Sida {prev_page} kunde inte hämtas"
+
+            elif key == '\x1b[A' or key.lower() == 'u': # Up arrow (previous link)
+                if links:
+                    if selected_link_idx == -1:
+                        selected_link_idx = len(links) - 1
+                    else:
+                        selected_link_idx = (selected_link_idx - 1) % len(links)
+
+            elif key == '\x1b[B' or key.lower() == 'd': # Down arrow (next link)
+                if links:
+                    if selected_link_idx == -1:
+                        selected_link_idx = 0
+                    else:
+                        selected_link_idx = (selected_link_idx + 1) % len(links)
+
+            # Handle subpage keys (next subpage)
+            elif key in ['+', ']', '.', '>']:
+                if page_data:
+                    subpages = page_data.get('subPages', [])
+                    if len(subpages) > 1:
+                        current_subpage_idx = (current_subpage_idx + 1) % len(subpages)
+                        selected_link_idx = -1
+
+            # Handle subpage keys (prev subpage)
+            elif key in ['-', '[', ',', '<']:
+                if page_data:
+                    subpages = page_data.get('subPages', [])
+                    if len(subpages) > 1:
+                        current_subpage_idx = (current_subpage_idx - 1) % len(subpages)
+                        selected_link_idx = -1
+
+            elif key.lower() == 'r': # Force reload
+                if current_page in cache:
+                    del cache[current_page]
+                draw_screen_with_lines(current_page, None, 0, "", [], [], -1, None)
+                new_data = fetch_page_data(current_page)
+                if new_data:
+                    cache[current_page] = new_data
+                    page_data = new_data
+                    current_subpage_idx = 0
+                    selected_link_idx = -1
+                else:
+                    error_message = f"Sida {current_page} kunde inte laddas om"
+
+    finally:
+        # Restore terminal settings: show cursor and exit alternate screen buffer
+        sys.stdout.write("\033[?25h")
+        sys.stdout.write("\033[?1049l")
+        sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
