@@ -8,8 +8,9 @@ import json
 import time
 import re
 import os
+import argparse
 
-VERSION = "v0.9.0"
+VERSION = "v1.0.0"
 
 # Cache for fetched pages: page_num (int) -> API response JSON data (dict)
 cache = {}
@@ -74,8 +75,11 @@ def extract_links(raw_lines):
             global_idx += 1
     return links
 
-def render_line(line, line_idx, line_links, selected_link_index):
+def render_line(line, line_idx, line_links, selected_link_index, use_color=True):
     """Colors a line of text, highlighting the selected link and styling other links."""
+    if not use_color:
+        return line
+
     if not line_links:
         # Style all 3-digit numbers with standard yellow color
         return re.sub(r'\b([1-9]\d{2})\b', r'\033[1;33m\1\033[0m', line)
@@ -186,14 +190,143 @@ def draw_screen_with_lines(page_num, page_data, current_subpage_idx, input_buffe
         sys.stdout.write(f"\033[7m{status_text.ljust(40)[:40]}\033[0m")
     sys.stdout.flush()
 
-def main():
+def valid_page_number(val):
+    """Validerar att angivet sidnummer är ett tresiffrigt tal mellan 100 och 999."""
+    try:
+        page = int(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{val}' är inte ett giltigt heltal.")
+    if not (100 <= page <= 999):
+        raise argparse.ArgumentTypeError(f"Sidnummer måste vara mellan 100 och 999 (fick {page}).")
+    return page
+
+class SwedishHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def add_usage(self, usage, actions, groups, prefix=None):
+        if prefix is None:
+            prefix = "användning: "
+        return super().add_usage(usage, actions, groups, prefix=prefix)
+
+class SwedishArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: fel: {message}\n")
+
+def build_parser():
+    """Skapar ArgumentParser med svensk hjälptext och inställningar."""
+    parser = SwedishArgumentParser(
+        prog="ttv",
+        usage="%(prog)s [-h] [-p] [--no-color] [-v] [sida]",
+        description="SVT Text-TV i terminalen.",
+        add_help=False,
+        formatter_class=SwedishHelpFormatter,
+        epilog="""Exempel:
+  ttv                             Starta Text-TV på sida 100
+  ttv 104                         Starta Text-TV på sida 104
+  ttv -p 130                      Skriv ut sida 130 till stdout och avsluta
+  ttv --print                     Skriv ut sida 100 till stdout och avsluta
+  ttv -p 130 --no-color > fil.txt Spara sida 130 till fil utan färg
+
+Navigering i klienten:
+  0-9               Slå in sidnummer direkt
+  Pil upp / u       Välj föregående länk
+  Pil ned / d       Välj nästa länk
+  Enter             Följ markerad länk
+  Pil vänster / p   Föregående sida
+  Pil höger / n     Nästa sida
+  + / -             Bläddra mellan undersidor
+  r                 Ladda om aktuell sida (tömmer cachen)
+  Esc               Rensa inmatning / avmarkera länk
+  q / Ctrl+C        Avsluta klienten
+"""
+    )
+    parser._positionals.title = "Positionella argument"
+    parser._optionals.title = "Flaggor"
+
+    parser.add_argument(
+        "sida",
+        nargs="?",
+        type=valid_page_number,
+        default=100,
+        help="Sidnummer att visa (100-999, standard: 100)"
+    )
+    parser.add_argument(
+        "-p", "--print",
+        action="store_true",
+        dest="print_mode",
+        help="Skriv ut sidan till stdout och avsluta"
+    )
+    parser.add_argument(
+        "-h", "--help",
+        action="help",
+        help="Visa denna hjälptext och avsluta"
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Inaktivera färger (ANSI-koder)"
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+        help="Visa versionsnummer och avsluta"
+    )
+    return parser
+
+def print_page(page_num: int, use_color: bool = True):
+    """Hämtar och skriver ut sidan till stdout och avslutar därefter."""
+    try:
+        page_data = fetch_page_data(page_num)
+        if not page_data:
+            sys.stderr.write(f"Fel: Kunde inte hämta sida {page_num}.\n")
+            sys.exit(1)
+
+        subpages = page_data.get('subPages', [])
+        if not subpages:
+            sys.stderr.write(f"Fel: Inga undersidor tillgängliga för sida {page_num}.\n")
+            sys.exit(1)
+
+        for sub_idx in range(len(subpages)):
+            if sub_idx > 0:
+                print()
+            lines, links = get_current_page_lines_and_links(page_data, sub_idx)
+            for line_idx, line in enumerate(lines):
+                if line_idx == 0:
+                    padded = line.ljust(40)
+                    if use_color:
+                        print(f"\033[1;37;44m{padded}\033[0m")
+                    else:
+                        print(padded)
+                else:
+                    line_links = [l for l in links if l['line_idx'] == line_idx]
+                    rendered = render_line(line, line_idx, line_links, -1, use_color=use_color)
+                    print(rendered)
+    except BrokenPipeError:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(0)
+
+def main(argv=None):
     global cache
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.print_mode:
+        use_color = not (args.no_color or bool(os.environ.get("NO_COLOR")))
+        print_page(args.sida, use_color=use_color)
+        return
+
+    # Kontrollera att standard input är en terminal i interaktivt läge
+    if not sys.stdin.isatty():
+        sys.stderr.write("Fel: Standard input är inte en terminal. Använd -p / --print för att skriva ut till stdout.\n")
+        sys.exit(1)
+
     # Enable alternate screen buffer and hide cursor
     sys.stdout.write("\033[?1049h")
     sys.stdout.write("\033[?25l")
     sys.stdout.flush()
 
-    current_page = 100
+    current_page = args.sida
     current_subpage_idx = 0
     input_buffer = ""
     error_message = None
@@ -209,7 +342,7 @@ def main():
         if page_data:
             cache[current_page] = page_data
         else:
-            error_message = "Kunde inte hämta startsidan"
+            error_message = f"Kunde inte hämta sida {current_page}"
 
         while True:
             # Get current lines and links
@@ -233,7 +366,7 @@ def main():
                 error_message = None
 
             # Handle keys
-            if key.lower() == 'q':
+            if key == '\x03' or key.lower() == 'q':
                 break
 
             elif key == '\x1b': # Escape key
@@ -398,6 +531,8 @@ def main():
                 else:
                     error_message = f"Sida {current_page} kunde inte laddas om"
 
+    except KeyboardInterrupt:
+        pass
     finally:
         # Restore terminal settings: show cursor and exit alternate screen buffer
         sys.stdout.write("\033[?25h")
