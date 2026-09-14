@@ -25,12 +25,9 @@ ttv
 # Starta interaktivt på en specifik sida
 ttv 104
 
-# Skriv ut en sida direkt till stdout och avsluta
+# Skriv ut en sida direkt till stdout (utan färgkoder) och avsluta
 ttv -p 130
 ttv --print 130
-
-# Spara en sida till textfil utan ANSI-färgkoder
-ttv -p 130 --no-color > sida130.txt
 
 # Visa hjälptext
 ttv -h

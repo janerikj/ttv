@@ -10,7 +10,7 @@ import re
 import os
 import argparse
 
-VERSION = "v1.0.0"
+VERSION = "v1.1.0"
 
 # Cache for fetched pages: page_num (int) -> API response JSON data (dict)
 cache = {}
@@ -75,11 +75,8 @@ def extract_links(raw_lines):
             global_idx += 1
     return links
 
-def render_line(line, line_idx, line_links, selected_link_index, use_color=True):
+def render_line(line, line_idx, line_links, selected_link_index):
     """Colors a line of text, highlighting the selected link and styling other links."""
-    if not use_color:
-        return line
-
     if not line_links:
         # Style all 3-digit numbers with standard yellow color
         return re.sub(r'\b([1-9]\d{2})\b', r'\033[1;33m\1\033[0m', line)
@@ -215,7 +212,7 @@ def build_parser():
     """Skapar ArgumentParser med svensk hjälptext och inställningar."""
     parser = SwedishArgumentParser(
         prog="ttv",
-        usage="%(prog)s [-h] [-p] [--no-color] [-v] [sida]",
+        usage="%(prog)s [-h] [-p] [-v] [sida]",
         description="SVT Text-TV i terminalen.",
         add_help=False,
         formatter_class=SwedishHelpFormatter,
@@ -224,7 +221,6 @@ def build_parser():
   ttv 104                         Starta Text-TV på sida 104
   ttv -p 130                      Skriv ut sida 130 till stdout och avsluta
   ttv --print                     Skriv ut sida 100 till stdout och avsluta
-  ttv -p 130 --no-color > fil.txt Spara sida 130 till fil utan färg
 
 Navigering i klienten:
   0-9               Slå in sidnummer direkt
@@ -261,11 +257,6 @@ Navigering i klienten:
         help="Visa denna hjälptext och avsluta"
     )
     parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help="Inaktivera färger (ANSI-koder)"
-    )
-    parser.add_argument(
         "-v", "--version",
         action="version",
         version=f"%(prog)s {VERSION}",
@@ -273,8 +264,8 @@ Navigering i klienten:
     )
     return parser
 
-def print_page(page_num: int, use_color: bool = True):
-    """Hämtar och skriver ut sidan till stdout och avslutar därefter."""
+def print_page(page_num: int):
+    """Hämtar och skriver ut sidan till stdout (utan färg) och avslutar därefter."""
     try:
         page_data = fetch_page_data(page_num)
         if not page_data:
@@ -289,18 +280,12 @@ def print_page(page_num: int, use_color: bool = True):
         for sub_idx in range(len(subpages)):
             if sub_idx > 0:
                 print()
-            lines, links = get_current_page_lines_and_links(page_data, sub_idx)
+            lines, _ = get_current_page_lines_and_links(page_data, sub_idx)
             for line_idx, line in enumerate(lines):
                 if line_idx == 0:
-                    padded = line.ljust(40)
-                    if use_color:
-                        print(f"\033[1;37;44m{padded}\033[0m")
-                    else:
-                        print(padded)
+                    print(line.ljust(40))
                 else:
-                    line_links = [l for l in links if l['line_idx'] == line_idx]
-                    rendered = render_line(line, line_idx, line_links, -1, use_color=use_color)
-                    print(rendered)
+                    print(line)
     except BrokenPipeError:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())
@@ -312,8 +297,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.print_mode:
-        use_color = not (args.no_color or bool(os.environ.get("NO_COLOR")))
-        print_page(args.sida, use_color=use_color)
+        print_page(args.sida)
         return
 
     # Kontrollera att standard input är en terminal i interaktivt läge
