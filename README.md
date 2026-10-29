@@ -1,4 +1,4 @@
-# ttv – SVT Text-TV i terminalen
+# ttv – SVT Text-TV i terminalen ![Version](https://img.shields.io/badge/version-v1.1.0-blue)
 
 En snabb, minimalistisk och tangentbordsstyrd terminalklient för SVT Text-TV skriven i Python.
 
